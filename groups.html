@@ -18,8 +18,80 @@
   <!-- NAVBAR -->
   <nav class="navbar navbar-dark bg-dark px-4">
     <a class="navbar-brand fw-bold">Student Groups</a>
-    <a href="index.html" class="btn btn-outline-light btn-sm">← Home</a>
+    <div class="d-flex gap-2">
+      <button class="btn btn-warning btn-sm" data-bs-toggle="modal" data-bs-target="#joinModal">+ Join Group</button>
+      <a href="index.html" class="btn btn-outline-light btn-sm">← Home</a>
+    </div>
   </nav>
+
+  <!-- JOIN GROUP MODAL -->
+  <div class="modal fade" id="joinModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content p-4 rounded-4 shadow joinModal">
+        <div class="modal-header border-0">
+          <h5 class="modal-title">Join a Group</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body pt-0">
+          <form id="studentForm" novalidate>
+
+            <div class="mb-3">
+              <label class="form-label">First Name</label>
+              <input type="text" class="form-control customInput" id="firstName" required>
+              <div class="errorText" id="firstNameError"></div>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">Middle Name <span class="text-muted">(optional)</span></label>
+              <input type="text" class="form-control customInput" id="middleName">
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">Last Name</label>
+              <input type="text" class="form-control customInput" id="lastName" required>
+              <div class="errorText" id="lastNameError"></div>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">Index Number</label>
+              <input type="text" class="form-control customInput" id="indexNumber" required>
+              <div class="errorText" id="indexError"></div>
+            </div>
+
+            <div class="mb-4">
+              <label class="form-label">Region</label>
+              <select class="form-select customInput" id="region">
+                <option>Ashanti</option>
+                <option>Brong Ahafo</option>
+                <option>Central</option>
+                <option>Eastern</option>
+                <option>Greater Accra</option>
+                <option>Northern</option>
+                <option>Upper East</option>
+                <option>Upper West</option>
+                <option>Volta</option>
+                <option>Western</option>
+              </select>
+            </div>
+
+            <button type="submit" class="btn joinBtn w-100">Join Group</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SUCCESS MODAL -->
+  <div class="modal fade" id="successModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content text-center p-4 rounded-4 shadow">
+        <!-- <div class="mb-2" style="font-size:48px;">🎉</div> -->
+        <h4 class="fw-bold">You're In!</h4>
+        <p id="groupMessage" class="text-muted"></p>
+        <button class="btn btn-primary px-4" onclick="loadGroups(); bootstrap.Modal.getInstance(document.getElementById('successModal')).hide();">View Groups</button>
+      </div>
+    </div>
+  </div>
 
   <!-- SEARCH BOX -->
   <div class="container mt-4">
