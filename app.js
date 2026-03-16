@@ -113,70 +113,44 @@ async function assignGroup(student, groupsSnap) {
       }
     }
 
+    // 2. No open same-region group found → create a new group for this region
+    //    regardless of whether other regions have open spots
     const groupsRef = db.collection("groups");
 
-    // 2. No same-region group available → create a new group
     if (!assignedGroup) {
-      // But first check: are ALL existing groups full?
-      // If yes, we still create a new group (handled below)
-      // If no, those open groups are for OTHER regions — we still create new
-      // UNLESS there are no groups at all yet
-      const allFull = groups.length > 0 && groups.every(g => g.members.length >= 10);
-
-      if (groups.length === 0 || !allFull) {
-        // Create a new group for this student's region
-        const groupNumber = groups.length + 1;
-        const newGroupRef = groupsRef.doc("Group-" + groupNumber);
-        await newGroupRef.set({
-          groupNumber: groupNumber,
-          label: "Group " + groupNumber,
-          region: student.region,
-          members: [],
-          locked: false,
-        });
-        assignedGroup = {
-          id: "Group-" + groupNumber,
-          groupNumber: groupNumber,
-          label: "Group " + groupNumber,
-          region: student.region,
-          members: [],
-        };
-      } else {
-        // ALL groups are full → last resort: find any open group
-        // (shouldn't happen since allFull=true, so fall through to create new)
-        const groupNumber = groups.length + 1;
-        const newGroupRef = groupsRef.doc("Group-" + groupNumber);
-        await newGroupRef.set({
-          groupNumber: groupNumber,
-          label: "Group " + groupNumber,
-          region: student.region,
-          members: [],
-          locked: false,
-        });
-        assignedGroup = {
-          id: "Group-" + groupNumber,
-          groupNumber: groupNumber,
-          label: "Group " + groupNumber,
-          region: student.region,
-          members: [],
-        };
-      }
+      const groupNumber = groups.length + 1;
+      const newGroupRef = groupsRef.doc("Group-" + groupNumber);
+      await newGroupRef.set({
+        groupNumber: groupNumber,
+        label: "Group " + groupNumber,
+        region: student.region,
+        members: [],
+        locked: false,
+      });
+      assignedGroup = {
+        id: "Group-" + groupNumber,
+        groupNumber: groupNumber,
+        label: "Group " + groupNumber,
+        region: student.region,
+        members: [],
+      };
     }
 
-    // 4. Add student to group
+    // 3. Add student to the group
     const groupRef = groupsRef.doc(assignedGroup.id);
     const newMembers = [...assignedGroup.members, student];
     const isNowFull = newMembers.length >= 10;
 
+    // Update group FIRST — only save to students collection if this succeeds
     await groupRef.update({
       members: newMembers,
       locked: isNowFull,
     });
 
-    // 5. Save to students collection
+    // 4. Group update succeeded — NOW safe to save to students collection
     await db.collection("students").add(student);
 
-    // 6. Show success
+    // 5. Show success
     showSuccess(assignedGroup.label || assignedGroup.id);
 
   } catch (err) {
@@ -189,8 +163,11 @@ async function assignGroup(student, groupsSnap) {
 // SUCCESS POPUP
 // =======================
 function showSuccess(groupLabel) {
-  document.getElementById("groupMessage").textContent =
-    "You have been placed in " + groupLabel + "! 🎉";
+  const groupMessageEl = document.getElementById("groupMessage");
+  if (groupMessageEl) {
+    groupMessageEl.innerHTML =
+      `<strong style="font-size: 1.2em;">You have been placed in ${groupLabel}</strong>`;
+  }
 
   // Close join modal first
   const joinModalEl = document.getElementById("joinModal");
@@ -202,6 +179,13 @@ function showSuccess(groupLabel) {
   setTimeout(() => {
     const successModal = new bootstrap.Modal(document.getElementById("successModal"));
     successModal.show();
+
+    // If on groups page, reload cards when success modal is dismissed
+    const successModalEl = document.getElementById("successModal");
+    successModalEl.addEventListener("hidden.bs.modal", function onHide() {
+      successModalEl.removeEventListener("hidden.bs.modal", onHide);
+      if (document.getElementById("groupsContainer")) loadGroups();
+    });
   }, 400);
 }
 
