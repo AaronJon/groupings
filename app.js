@@ -136,16 +136,21 @@ async function assignGroup(student, groupsSnap) {
       };
     }
 
-    // 3. Add student to the group
+    // 3. Add student to the group atomically — prevents race condition overwrites
     const groupRef = groupsRef.doc(assignedGroup.id);
-    const newMembers = [...assignedGroup.members, student];
-    const isNowFull = newMembers.length >= 10;
 
-    // Update group FIRST — only save to students collection if this succeeds
+    // arrayUnion lets Firestore merge on the server side safely
+    // so two students submitting at the same time never overwrite each other
     await groupRef.update({
-      members: newMembers,
-      locked: isNowFull,
+      members: firebase.firestore.FieldValue.arrayUnion(student),
     });
+
+    // Check if now full and lock
+    const updatedDoc = await groupRef.get();
+    const updatedCount = updatedDoc.data().members.length;
+    if (updatedCount >= 10) {
+      await groupRef.update({ locked: true });
+    }
 
     // 4. Group update succeeded — NOW safe to save to students collection
     await db.collection("students").add(student);
@@ -163,11 +168,8 @@ async function assignGroup(student, groupsSnap) {
 // SUCCESS POPUP
 // =======================
 function showSuccess(groupLabel) {
-  const groupMessageEl = document.getElementById("groupMessage");
-  if (groupMessageEl) {
-    groupMessageEl.innerHTML =
-      `<strong style="font-size: 1.2em;">You have been placed in ${groupLabel}</strong>`;
-  }
+  document.getElementById("groupMessage").textContent =
+    "You have been placed in " + groupLabel + "! 🎉";
 
   // Close join modal first
   const joinModalEl = document.getElementById("joinModal");
