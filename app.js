@@ -55,12 +55,11 @@ if (form) {
       joinedAt: new Date().toISOString(),
     };
 
-    // CHECK DUPLICATE + LOAD GROUPS at the same time
+    // CHECK DUPLICATE first, then assign group with fresh data
     try {
-      const [dupSnapshot, groupsSnap] = await Promise.all([
-        db.collection("students").where("index", "==", student.index).get(),
-        db.collection("groups").get()
-      ]);
+      const dupSnapshot = await db.collection("students")
+        .where("index", "==", student.index)
+        .get();
 
       if (!dupSnapshot.empty) {
         document.getElementById("indexError").textContent =
@@ -70,7 +69,7 @@ if (form) {
         return;
       }
 
-      await assignGroup(student, groupsSnap);
+      await assignGroup(student);
 
     } catch (err) {
       console.error("Error submitting:", err);
@@ -86,81 +85,147 @@ if (form) {
 
 // =======================
 // GROUP ASSIGNMENT
-// Priority:
-// 1. Open same-region group → join it
-// 2. No same-region group (or all full) → create a NEW group
-// 3. LAST RESORT only: if ALL groups are full → find any open group
-//    (this handles the edge case where a new group was just created but
-//     is open to mixed students filling remaining spots)
+// Uses Firestore transaction so reads + writes are atomic
+// Nothing gets half-saved — either everything succeeds or nothing does
 // =======================
-async function assignGroup(student, groupsSnap) {
+async function assignGroup(student) {
   try {
-    let groups = [];
-    groupsSnap.forEach((doc) => {
-      groups.push({ id: doc.id, ...doc.data() });
-    });
+    const groupsRef   = db.collection("groups");
+    const studentsRef = db.collection("students");
+    const counterRef  = db.collection("meta").doc("groupCounter");
 
-    // Sort by groupNumber so earlier groups are filled first
-    groups.sort((a, b) => (a.groupNumber || 0) - (b.groupNumber || 0));
+    const assignedLabel = await db.runTransaction(async (transaction) => {
 
-    let assignedGroup = null;
+      // 1. Fetch ALL groups + counter fresh inside transaction
+      const [groupsSnap, counterDoc] = await Promise.all([
+        groupsRef.get(),
+        counterRef.get()
+      ]);
 
-    // 1. Find an open same-region group
-    for (let group of groups) {
-      if (group.members.length < 10 && group.region === student.region) {
-        assignedGroup = group;
-        break;
-      }
-    }
-
-    // 2. No open same-region group found → create a new group for this region
-    //    regardless of whether other regions have open spots
-    const groupsRef = db.collection("groups");
-
-    if (!assignedGroup) {
-      const groupNumber = groups.length + 1;
-      const newGroupRef = groupsRef.doc("Group-" + groupNumber);
-      await newGroupRef.set({
-        groupNumber: groupNumber,
-        label: "Group " + groupNumber,
-        region: student.region,
-        members: [],
-        locked: false,
+      let groups = [];
+      groupsSnap.forEach((doc) => {
+        groups.push({ id: doc.id, ref: doc.ref, ...doc.data() });
       });
-      assignedGroup = {
-        id: "Group-" + groupNumber,
-        groupNumber: groupNumber,
-        label: "Group " + groupNumber,
-        region: student.region,
-        members: [],
-      };
-    }
 
-    // 3. Add student to the group atomically — prevents race condition overwrites
-    const groupRef = groupsRef.doc(assignedGroup.id);
+      // Sort by groupNumber — fill earlier groups first
+      groups.sort((a, b) => (a.groupNumber || 0) - (b.groupNumber || 0));
 
-    // arrayUnion lets Firestore merge on the server side safely
-    // so two students submitting at the same time never overwrite each other
-    await groupRef.update({
-      members: firebase.firestore.FieldValue.arrayUnion(student),
+      // Get next group number from counter (never from groups.length)
+      const currentCount = counterDoc.exists ? counterDoc.data().count : 0;
+
+      let assignedGroup = null;
+
+      // 2. Find open same-region group
+      for (let group of groups) {
+        const memberCount = (group.members || []).length;
+        if (!group.locked && memberCount < 10 && group.region === student.region) {
+          assignedGroup = group;
+          break;
+        }
+      }
+
+      // 3. No open same-region group → create new group using counter
+      if (!assignedGroup) {
+        const groupNumber = currentCount + 1;
+        const newGroupRef = groupsRef.doc("Group-" + groupNumber);
+        assignedGroup = {
+          id: "Group-" + groupNumber,
+          ref: newGroupRef,
+          groupNumber: groupNumber,
+          label: "Group " + groupNumber,
+          region: student.region,
+          members: [],
+          locked: false,
+        };
+        // Create new group doc
+        transaction.set(newGroupRef, {
+          groupNumber: groupNumber,
+          label: "Group " + groupNumber,
+          region: student.region,
+          members: [],
+          locked: false,
+        });
+        // Increment counter
+        transaction.set(counterRef, { count: groupNumber });
+      }
+
+      // 4. Add student to group
+      const existingMembers = assignedGroup.members || [];
+      const newMembers = [...existingMembers, student];
+      const isNowFull = newMembers.length >= 10;
+
+      transaction.update(assignedGroup.ref, {
+        members: newMembers,
+        locked: isNowFull,
+      });
+
+      // 5. Save student to students collection in same transaction
+      const newStudentRef = studentsRef.doc();
+      transaction.set(newStudentRef, {
+        ...student,
+        groupId: assignedGroup.id,
+        groupLabel: assignedGroup.label,
+      });
+
+      return assignedGroup.label;
     });
 
-    // Check if now full and lock
-    const updatedDoc = await groupRef.get();
-    const updatedCount = updatedDoc.data().members.length;
-    if (updatedCount >= 10) {
-      await groupRef.update({ locked: true });
-    }
-
-    // 4. Group update succeeded — NOW safe to save to students collection
-    await db.collection("students").add(student);
-
-    // 5. Show success
-    showSuccess(assignedGroup.label || assignedGroup.id);
+    showSuccess(assignedLabel);
 
   } catch (err) {
     console.error("Error assigning group:", err);
     alert("Something went wrong. Please try again.");
+  }
+}
+
+// =======================
+// ORPHAN RECOVERY
+// Finds students in the students collection who are not in any group
+// and reassigns them automatically
+// =======================
+async function recoverOrphanedStudents() {
+  try {
+    const [studentsSnap, groupsSnap] = await Promise.all([
+      db.collection("students").get(),
+      db.collection("groups").get()
+    ]);
+
+    // Build a set of all index numbers currently in any group
+    const indexesInGroups = new Set();
+    groupsSnap.forEach((doc) => {
+      const members = doc.data().members || [];
+      members.forEach((m) => indexesInGroups.add(m.index));
+    });
+
+    // Find students whose index is NOT in any group
+    const orphans = [];
+    studentsSnap.forEach((doc) => {
+      const s = doc.data();
+      if (!indexesInGroups.has(s.index)) {
+        orphans.push(s);
+      }
+    });
+
+    if (orphans.length === 0) return;
+
+    console.log(`Found ${orphans.length} orphaned student(s). Reassigning...`);
+
+    // Reassign each orphan — delete from students first to avoid dup check blocking
+    for (const orphan of orphans) {
+      // Remove from students collection so duplicate check doesn't block them
+      const existing = await db.collection("students")
+        .where("index", "==", orphan.index).get();
+      for (const doc of existing.docs) {
+        await doc.ref.delete();
+      }
+      // Reassign to a group
+      await assignGroup(orphan);
+    }
+
+    console.log("Orphan recovery complete.");
+
+  } catch (err) {
+    console.error("Orphan recovery error:", err);
   }
 }
 
@@ -256,8 +321,8 @@ async function loadGroups() {
 
 loadGroups();
 
-// =======================
-// VIEW MEMBERS MODAL
+// Auto-recover any students who lost their group due to past overwrites
+recoverOrphanedStudents();
 // =======================
 async function viewGroup(groupId, groupLabel) {
   try {
