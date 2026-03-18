@@ -41,30 +41,27 @@ if (form) {
 
     if (!valid) return;
 
-    // Disable button to prevent double submit
     const submitBtn = form.querySelector("button[type='submit']");
     submitBtn.disabled = true;
     submitBtn.textContent = "Submitting...";
 
     const student = {
-      first:  first.value.trim(),
-      middle: middle.value.trim(),
-      last:   last.value.trim(),
-      index:  index.value.trim(),
-      region: region.value,
+      first:    first.value.trim(),
+      middle:   middle.value.trim(),
+      last:     last.value.trim(),
+      index:    index.value.trim(),
+      region:   region.value,
       joinedAt: new Date().toISOString(),
     };
 
-    // CHECK IF INDEX ALREADY HAS A GROUP
-    // If index exists in students BUT has no group → allow them through (orphan)
-    // If index exists in students AND has a group → block as duplicate
     try {
+      // Check if index exists in students collection
       const dupSnapshot = await db.collection("students")
         .where("index", "==", student.index)
         .get();
 
       if (!dupSnapshot.empty) {
-        // Check if this student is actually in any group
+        // Index found — check if they actually have a group
         const groupsSnap = await db.collection("groups").get();
         let isInGroup = false;
 
@@ -76,15 +73,14 @@ if (form) {
         });
 
         if (isInGroup) {
-          // Truly already registered and has a group — block them
+          // Has a group — genuine duplicate, block them
           document.getElementById("indexError").textContent =
             "This index number has already been used.";
           submitBtn.disabled = false;
           submitBtn.textContent = "Join Group";
           return;
         } else {
-          // Orphan — they registered but lost their group
-          // Delete their old students record so they get a clean entry
+          // Orphan — in students but no group, clean up and let them through
           for (const doc of dupSnapshot.docs) {
             await doc.ref.delete();
           }
@@ -107,83 +103,108 @@ if (form) {
 
 // =======================
 // GROUP ASSIGNMENT
-// Priority:
-// 1. Find open same-region group → join it
-// 2. No same-region group available → create a new group
-// 3. arrayUnion used for safe atomic writes
+// Transaction locks the exact target group doc during read+write
+// so no two students can write to it at the same time
+// If group fills up between check and write → auto retry
 // =======================
 async function assignGroup(student) {
   try {
     const groupsRef = db.collection("groups");
 
-    // Always fetch fresh live data
+    // Fetch all groups fresh
     const freshSnap = await groupsRef.get();
     let groups = [];
     freshSnap.forEach((doc) => {
-      groups.push({ id: doc.id, ref: doc.ref, ...doc.data() });
+      const data = doc.data();
+      groups.push({
+        id:          doc.id,
+        ref:         doc.ref,
+        groupNumber: parseInt(data.groupNumber) || 0,
+        label:       data.label || doc.id,
+        region:      (data.region || "").trim(),
+        members:     data.members || [],
+        locked:      data.locked || false,
+      });
     });
+    groups.sort((a, b) => a.groupNumber - b.groupNumber);
 
-    // Sort by groupNumber — fill earlier groups first
-    groups.sort((a, b) => (a.groupNumber || 0) - (b.groupNumber || 0));
-
-    let assignedGroup = null;
-
-    // 1. Find open same-region group
+    // Find open same-region group
+    let targetGroup = null;
+    const studentRegion = (student.region || "").trim();
     for (let group of groups) {
-      const count = (group.members || []).length;
-      if (!group.locked && count < 10 && group.region === student.region) {
-        assignedGroup = group;
+      const count = group.members.length;
+      if (count < 10 && group.region === studentRegion) {
+        targetGroup = group;
         break;
       }
     }
 
-    // 2. No same-region group → create a new one
-    if (!assignedGroup) {
-      // Use max existing groupNumber to avoid duplicates
-      const maxNumber = groups.reduce((max, g) => Math.max(max, g.groupNumber || 0), 0);
+    // No same-region group → create a new one
+    if (!targetGroup) {
+      const maxNumber   = groups.reduce((max, g) => Math.max(max, g.groupNumber || 0), 0);
       const groupNumber = maxNumber + 1;
       const newGroupRef = groupsRef.doc("Group-" + groupNumber);
 
       await newGroupRef.set({
         groupNumber: groupNumber,
         label:       "Group " + groupNumber,
-        region:      student.region,
+        region:      studentRegion,
         members:     [],
         locked:      false,
       });
 
-      assignedGroup = {
+      targetGroup = {
         id:          "Group-" + groupNumber,
         ref:         newGroupRef,
         groupNumber: groupNumber,
         label:       "Group " + groupNumber,
-        region:      student.region,
+        region:      studentRegion,
         members:     [],
       };
     }
 
-    // 3. Add student atomically with arrayUnion — prevents overwrites
-    const groupRef = assignedGroup.ref || groupsRef.doc(assignedGroup.id);
-    await groupRef.update({
-      members: firebase.firestore.FieldValue.arrayUnion(student),
+    const groupRef    = targetGroup.ref || groupsRef.doc(targetGroup.id);
+    const groupLabel  = targetGroup.label;
+
+    // Transaction locks this specific group doc
+    // reads the TRUE live member count
+    // writes only if still has space
+    // if full → throws GROUP_FULL → retry entire function
+    await db.runTransaction(async (transaction) => {
+      const groupDoc       = await transaction.get(groupRef);
+      const currentMembers = groupDoc.data().members || [];
+
+      if (currentMembers.length >= 10) {
+        throw new Error("GROUP_FULL");
+      }
+
+      const newMembers = [...currentMembers, student];
+      const isNowFull  = newMembers.length >= 10;
+
+      // Write group update
+      transaction.update(groupRef, {
+        members: newMembers,
+        locked:  isNowFull,
+      });
+
+      // Write student record in same transaction
+      // Either BOTH succeed or BOTH fail — no orphans possible
+      const newStudentRef = db.collection("students").doc();
+      transaction.set(newStudentRef, student);
     });
 
-    // 4. Check live count and lock if full
-    const updatedDoc   = await groupRef.get();
-    const updatedCount = updatedDoc.data().members.length;
-    if (updatedCount >= 10) {
-      await groupRef.update({ locked: true });
-    }
-
-    // 5. Save to students collection only after group write succeeded
-    await db.collection("students").add(student);
-
-    // 6. Show success
-    showSuccess(assignedGroup.label);
+    showSuccess(groupLabel);
 
   } catch (err) {
-    console.error("Error assigning group:", err);
-    alert("Something went wrong. Please try again.");
+    if (err.message === "GROUP_FULL") {
+      // Group filled between our check and transaction write
+      // Retry — this time that group will be skipped as full
+      console.log("Group was full, retrying assignment...");
+      await assignGroup(student);
+    } else {
+      console.error("Error assigning group:", err);
+      alert("Something went wrong. Please try again.");
+    }
   }
 }
 
@@ -194,7 +215,6 @@ function showSuccess(groupLabel) {
   document.getElementById("groupMessage").textContent =
     "You have been placed in " + groupLabel + "! 🎉";
 
-  // Close join modal first
   const joinModalEl = document.getElementById("joinModal");
   if (joinModalEl) {
     const joinModal = bootstrap.Modal.getInstance(joinModalEl);
@@ -205,7 +225,6 @@ function showSuccess(groupLabel) {
     const successModal = new bootstrap.Modal(document.getElementById("successModal"));
     successModal.show();
 
-    // If on groups page, reload cards when success modal is dismissed
     const successModalEl = document.getElementById("successModal");
     successModalEl.addEventListener("hidden.bs.modal", function onHide() {
       successModalEl.removeEventListener("hidden.bs.modal", onHide);
@@ -229,8 +248,8 @@ async function loadGroups() {
 
   try {
     const groupsSnap = await db.collection("groups").get();
-    const groupDocs = [];
-    groupsSnap.forEach((doc) => groupDocs.push({ id: doc.id, ...doc.data(), _ref: doc }));
+    const groupDocs  = [];
+    groupsSnap.forEach((doc) => groupDocs.push({ id: doc.id, ...doc.data() }));
     groupDocs.sort((a, b) => (a.groupNumber || 0) - (b.groupNumber || 0));
 
     if (groupDocs.length === 0) {
@@ -241,11 +260,11 @@ async function loadGroups() {
     container.innerHTML = "";
 
     groupDocs.forEach((group) => {
-      const count = group.members ? group.members.length : 0;
-      const label = group.label || group.id;
-      const isLocked = count >= 10;
+      const count      = group.members ? group.members.length : 0;
+      const label      = group.label || group.id;
+      const isLocked   = count >= 10;
       const fillPercent = (count / 10) * 100;
-      const barColor = isLocked ? "#e63946" : count >= 7 ? "#f4a261" : "#4facfe";
+      const barColor   = isLocked ? "#e63946" : count >= 7 ? "#f4a261" : "#4facfe";
 
       const col = document.createElement("div");
       col.className = "col-sm-6 col-md-4 col-lg-3";
@@ -278,15 +297,17 @@ async function loadGroups() {
 }
 
 loadGroups();
+
+// =======================
+// VIEW MEMBERS MODAL
 // =======================
 async function viewGroup(groupId, groupLabel) {
   try {
-    const doc = await db.collection("groups").doc(groupId).get();
-    const group = doc.data();
+    const doc     = await db.collection("groups").doc(groupId).get();
+    const group   = doc.data();
     const members = group.members || [];
 
-    // Set modal title
-    document.getElementById("modalGroupTitle").textContent = groupLabel || groupId;
+    document.getElementById("modalGroupTitle").textContent  = groupLabel || groupId;
     document.getElementById("modalMemberCount").textContent = members.length + " / 10 members";
 
     const list = document.getElementById("memberList");
@@ -326,8 +347,8 @@ async function searchStudent() {
   const result = document.getElementById("searchResult");
 
   if (!query) {
-    result.innerHTML = "Please enter a name to search.";
-    result.className = "text-warning fw-bold";
+    result.innerHTML  = "Please enter a name to search.";
+    result.className  = "text-warning fw-bold";
     return;
   }
 
@@ -336,11 +357,11 @@ async function searchStudent() {
 
   try {
     const groupsSnap = await db.collection("groups").get();
-    const matches = [];
+    const matches    = [];
 
     groupsSnap.forEach((doc) => {
-      const group = doc.data();
-      const label = group.label || doc.id;
+      const group   = doc.data();
+      const label   = group.label || doc.id;
       const members = group.members || [];
 
       members.forEach((m) => {
@@ -357,7 +378,6 @@ async function searchStudent() {
       return;
     }
 
-    // Build result lines for all matches
     result.className = "text-success fw-bold";
     result.innerHTML = matches.map(({ m, label }) => {
       const fullName = `${m.first} ${m.middle ? m.middle + " " : ""}${m.last}`;
@@ -367,6 +387,6 @@ async function searchStudent() {
   } catch (err) {
     console.error("Error searching:", err);
     result.textContent = "Search failed. Please try again.";
-    result.className = "text-danger fw-bold";
+    result.className   = "text-danger fw-bold";
   }
 }
